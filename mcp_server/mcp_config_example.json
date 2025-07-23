@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "graphiti_mcp_server": {
+      "command": "uv",
+      "args": ["run", "python", "graphiti_mcp_server.py", "--use-custom-entities"],
+      "cwd": "/Users/danieltremer/Documents/graphiti/mcp_server",
+      "env": {
+        "GROUP_ID": "your-session-id",
+        "OPENAI_API_KEY": "your-openai-api-key-here",
+        "FALKORDB_HOST": "localhost",
+        "FALKORDB_PORT": "6379"
+      }
+    }
+  }
+} 

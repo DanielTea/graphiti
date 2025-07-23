@@ -5,20 +5,28 @@ Graphiti MCP Server - Exposes Graphiti functionality through the Model Context P
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, TypedDict, cast
+from typing import Optional
 
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-from openai import AsyncAzureOpenAI
 from pydantic import BaseModel, Field
+from contextvars import ContextVar
+from typing import Dict, Any
 
 from graphiti_core import Graphiti
+from graphiti_core.driver.falkordb_driver import FalkorDriver
+from graphiti_core.driver.driver import GraphDriver
+try:
+    from falkordb.asyncio import FalkorDB
+except ImportError:
+    raise ImportError('falkordb is required for FalkorDB driver. Install it with: pip install falkordb')
 from graphiti_core.edges import EntityEdge
 from graphiti_core.embedder.azure_openai import AzureOpenAIEmbedderClient
 from graphiti_core.embedder.client import EmbedderClient
@@ -38,8 +46,8 @@ from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 load_dotenv()
 
 
-DEFAULT_LLM_MODEL = 'gpt-4.1-mini'
-SMALL_LLM_MODEL = 'gpt-4.1-nano'
+DEFAULT_LLM_MODEL = 'gpt-4o-mini'
+SMALL_LLM_MODEL = 'gpt-4o-nano'
 DEFAULT_EMBEDDER_MODEL = 'text-embedding-3-small'
 
 # Semaphore limit for concurrent Graphiti operations.
@@ -168,6 +176,7 @@ class StatusResponse(TypedDict):
 
 
 def create_azure_credential_token_provider() -> Callable[[], str]:
+    from azure.identity import DefaultAzureCredential, get_bearer_token_provider
     credential = DefaultAzureCredential()
     token_provider = get_bearer_token_provider(
         credential, 'https://cognitiveservices.azure.com/.default'
@@ -180,26 +189,22 @@ def create_azure_credential_token_provider() -> Callable[[], str]:
 # - GraphitiConfig is the top-level configuration
 #   - LLMConfig handles all OpenAI/LLM related settings
 #   - EmbedderConfig manages embedding settings
-#   - Neo4jConfig manages database connection details
+#   - FalkorDBConfig manages database connection details
 #   - Various other settings like group_id and feature flags
 # Configuration values are loaded from:
 # 1. Default values in the class definitions
 # 2. Environment variables (loaded via load_dotenv())
 # 3. Command line arguments (which override environment variables)
 class GraphitiLLMConfig(BaseModel):
-    """Configuration for the LLM client.
+    """Configuration for Graphiti LLM client."""
 
-    Centralizes all LLM-specific configuration parameters including API keys and model selection.
-    """
-
-    api_key: str | None = None
+    api_key: Optional[str] = None
     model: str = DEFAULT_LLM_MODEL
     small_model: str = SMALL_LLM_MODEL
+    azure_openai_endpoint: Optional[str] = None
+    azure_openai_deployment_name: Optional[str] = None
+    azure_openai_api_version: Optional[str] = None
     temperature: float = 0.0
-    azure_openai_endpoint: str | None = None
-    azure_openai_deployment_name: str | None = None
-    azure_openai_api_version: str | None = None
-    azure_openai_use_managed_identity: bool = False
 
     @classmethod
     def from_env(cls) -> 'GraphitiLLMConfig':
@@ -300,6 +305,7 @@ class GraphitiLLMConfig(BaseModel):
             if self.azure_openai_use_managed_identity:
                 # Use managed identity for authentication
                 token_provider = create_azure_credential_token_provider()
+                from openai import AsyncAzureOpenAI
                 return AzureOpenAILLMClient(
                     azure_client=AsyncAzureOpenAI(
                         azure_endpoint=self.azure_openai_endpoint,
@@ -316,6 +322,7 @@ class GraphitiLLMConfig(BaseModel):
                 )
             elif self.api_key:
                 # Use API key for authentication
+                from openai import AsyncAzureOpenAI
                 return AzureOpenAILLMClient(
                     azure_client=AsyncAzureOpenAI(
                         azure_endpoint=self.azure_openai_endpoint,
@@ -347,17 +354,13 @@ class GraphitiLLMConfig(BaseModel):
 
 
 class GraphitiEmbedderConfig(BaseModel):
-    """Configuration for the embedder client.
+    """Configuration for Graphiti embedder client."""
 
-    Centralizes all embedding-related configuration parameters.
-    """
-
+    api_key: Optional[str] = None
+    azure_openai_endpoint: Optional[str] = None
+    azure_openai_deployment_name: Optional[str] = None
+    azure_openai_api_version: Optional[str] = None
     model: str = DEFAULT_EMBEDDER_MODEL
-    api_key: str | None = None
-    azure_openai_endpoint: str | None = None
-    azure_openai_deployment_name: str | None = None
-    azure_openai_api_version: str | None = None
-    azure_openai_use_managed_identity: bool = False
 
     @classmethod
     def from_env(cls) -> 'GraphitiEmbedderConfig':
@@ -416,6 +419,7 @@ class GraphitiEmbedderConfig(BaseModel):
             if self.azure_openai_use_managed_identity:
                 # Use managed identity for authentication
                 token_provider = create_azure_credential_token_provider()
+                from openai import AsyncAzureOpenAI
                 return AzureOpenAIEmbedderClient(
                     azure_client=AsyncAzureOpenAI(
                         azure_endpoint=self.azure_openai_endpoint,
@@ -427,6 +431,7 @@ class GraphitiEmbedderConfig(BaseModel):
                 )
             elif self.api_key:
                 # Use API key for authentication
+                from openai import AsyncAzureOpenAI
                 return AzureOpenAIEmbedderClient(
                     azure_client=AsyncAzureOpenAI(
                         azure_endpoint=self.azure_openai_endpoint,
@@ -449,20 +454,24 @@ class GraphitiEmbedderConfig(BaseModel):
             return OpenAIEmbedder(config=embedder_config)
 
 
-class Neo4jConfig(BaseModel):
-    """Configuration for Neo4j database connection."""
+class FalkorDBConfig(BaseModel):
+    """Configuration for FalkorDB database connection."""
 
-    uri: str = 'bolt://localhost:7687'
-    user: str = 'neo4j'
-    password: str = 'password'
+    host: str = 'localhost'
+    port: int = 6379
+    username: Optional[str] = None
+    password: Optional[str] = None
+    database: str = 'default'
 
     @classmethod
-    def from_env(cls) -> 'Neo4jConfig':
-        """Create Neo4j configuration from environment variables."""
+    def from_env(cls) -> 'FalkorDBConfig':
+        """Create FalkorDB configuration from environment variables."""
         return cls(
-            uri=os.environ.get('NEO4J_URI', 'bolt://localhost:7687'),
-            user=os.environ.get('NEO4J_USER', 'neo4j'),
-            password=os.environ.get('NEO4J_PASSWORD', 'password'),
+            host=os.environ.get('FALKORDB_HOST', 'localhost'),
+            port=int(os.environ.get('FALKORDB_PORT', '6379')),
+            username=os.environ.get('FALKORDB_USERNAME'),
+            password=os.environ.get('FALKORDB_PASSWORD'),
+            database=os.environ.get('FALKORDB_DATABASE', 'default'),
         )
 
 
@@ -474,8 +483,8 @@ class GraphitiConfig(BaseModel):
 
     llm: GraphitiLLMConfig = Field(default_factory=GraphitiLLMConfig)
     embedder: GraphitiEmbedderConfig = Field(default_factory=GraphitiEmbedderConfig)
-    neo4j: Neo4jConfig = Field(default_factory=Neo4jConfig)
-    group_id: str | None = None
+    falkordb: FalkorDBConfig = Field(default_factory=FalkorDBConfig)
+    group_id: Optional[str] = None
     use_custom_entities: bool = False
     destroy_graph: bool = False
 
@@ -485,7 +494,8 @@ class GraphitiConfig(BaseModel):
         return cls(
             llm=GraphitiLLMConfig.from_env(),
             embedder=GraphitiEmbedderConfig.from_env(),
-            neo4j=Neo4jConfig.from_env(),
+            falkordb=FalkorDBConfig.from_env(),
+            group_id=os.environ.get('GROUP_ID'),
         )
 
     @classmethod
@@ -494,9 +504,13 @@ class GraphitiConfig(BaseModel):
         # Start with environment configuration
         config = cls.from_env()
 
-        # Apply CLI overrides
+        # Apply CLI overrides for group_id
+        # Priority: CLI argument > Environment variable > default
         if args.group_id:
             config.group_id = args.group_id
+        elif config.group_id:
+            # Keep the environment variable value
+            pass
         else:
             config.group_id = 'default'
 
@@ -512,12 +526,7 @@ class GraphitiConfig(BaseModel):
 class MCPConfig(BaseModel):
     """Configuration for MCP server."""
 
-    transport: str = 'sse'  # Default to SSE transport
-
-    @classmethod
-    def from_cli(cls, args: argparse.Namespace) -> 'MCPConfig':
-        """Create MCP configuration from CLI arguments."""
-        return cls(transport=args.transport)
+    transport: str = 'stdio'  # Default to stdio transport
 
 
 # Configure logging
@@ -552,20 +561,26 @@ Key capabilities:
 4. Retrieve specific entity edges or episodes by UUID
 5. Manage the knowledge graph with tools like delete_episode, delete_entity_edge, and clear_graph
 
-The server connects to a database for persistent storage and uses language models for certain operations. 
+The server connects to a FalkorDB database for persistent storage and uses language models for certain operations. 
 Each piece of information is organized by group_id, allowing you to maintain separate knowledge domains.
+The group_id is automatically determined from the GROUP_ID environment variable, CLI argument, or defaults to "default".
+All operations use the same group_id for consistency.
 
 When adding information, provide descriptive names and detailed content to improve search quality. 
-When searching, use specific queries and consider filtering by group_id for more relevant results.
+When searching, use specific queries for more relevant results.
 
-For optimal performance, ensure the database is properly configured and accessible, and valid 
+For optimal performance, ensure the FalkorDB database is properly configured and accessible, and valid 
 API keys are provided for any language model operations.
 """
+
+# Context variable to store current request headers
+current_headers: ContextVar[Dict[str, str] | None] = ContextVar('current_headers', default=None)
 
 # MCP server instance
 mcp = FastMCP(
     'Graphiti Agent Memory',
     instructions=GRAPHITI_MCP_INSTRUCTIONS,
+    stateless_http=True,
 )
 
 # Initialize Graphiti client
@@ -583,21 +598,93 @@ async def initialize_graphiti():
             # If custom entities are enabled, we must have an LLM client
             raise ValueError('OPENAI_API_KEY must be set when custom entities are enabled')
 
-        # Validate Neo4j configuration
-        if not config.neo4j.uri or not config.neo4j.user or not config.neo4j.password:
-            raise ValueError('NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD must be set')
+        # Validate FalkorDB configuration
+        if not config.falkordb.host:
+            raise ValueError('FALKORDB_HOST must be set')
 
+        logger.info(f'Using FalkorDB database: {config.falkordb.database} (group_id will determine actual database)')
+        
         embedder_client = config.embedder.create_client()
 
-        # Initialize Graphiti client
-        graphiti_client = Graphiti(
-            uri=config.neo4j.uri,
-            user=config.neo4j.user,
-            password=config.neo4j.password,
-            llm_client=llm_client,
-            embedder=embedder_client,
-            max_coroutines=SEMAPHORE_LIMIT,
+        # Create a custom FalkorDB driver that uses group_id as database name
+        class CustomFalkorDBDriver(FalkorDriver):
+            def __init__(self, host, port, username=None, password=None, base_database='default'):
+                # Store connection details first
+                self._base_database = base_database
+                self._host = host
+                self._port = port
+                self._username = username
+                self._password = password
+                self._database = base_database
+                
+                # Initialize the base class without calling its __init__
+                super(GraphDriver, self).__init__()
+                
+                # Create FalkorDB client without authentication if credentials are empty
+                if username and password and username.strip() != '' and password.strip() != '':
+                    self.client = FalkorDB(host=host, port=port, username=username, password=password)
+                else:
+                    # Don't pass any authentication parameters if not provided
+                    self.client = FalkorDB(host=host, port=port)
+                
+                # Set the fulltext syntax
+                self.fulltext_syntax = '@'
+                
+            def sanitize_database_name(self, group_id: str) -> str:
+                """Convert group_id to valid FalkorDB database name."""
+                # FalkorDB database names follow Redis conventions:
+                # - Can contain letters, numbers, dots, dashes, and underscores
+                # - Should be reasonable length
+                import re
+                sanitized = re.sub(r'[^a-zA-Z0-9._-]', '-', group_id.lower())
+                if not sanitized[0].isalpha():
+                    sanitized = 'db-' + sanitized
+                # Remove consecutive dashes and trim
+                sanitized = re.sub(r'-+', '-', sanitized).strip('-')
+                return sanitized[:63]  # Limit to 63 characters
+                
+            async def ensure_database_exists(self, database_name: str):
+                """Create database if it doesn't exist and initialize it."""
+                try:
+                    # FalkorDB automatically creates databases when accessed
+                    # We just need to switch to the database
+                    self._database = database_name
+                    logger.info(f"Switched to FalkorDB database: {database_name}")
+                        
+                except Exception as e:
+                    logger.warning(f"Could not switch to database {database_name}: {e}")
+                    # Fall back to base database if creation fails
+                    logger.info(f"Falling back to base database: {self._base_database}")
+                    self._database = self._base_database
+                    
+            async def set_database_for_group(self, group_id: str):
+                """Set the database based on group_id."""
+                if group_id:
+                    database_name = self.sanitize_database_name(group_id)
+                    try:
+                        await self.ensure_database_exists(database_name)
+                        self._database = database_name
+                        logger.info(f"Switched to database: {database_name} for group_id: {group_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to switch to database {database_name}: {e}")
+                        logger.info(f"Falling back to base database: {self._base_database}")
+                        self._database = self._base_database
+                else:
+                    self._database = self._base_database
+                    logger.info(f"Using base database: {self._base_database}")
+
+        # Create custom driver with database support
+        # Use the configured database as the base database for fallback
+        falkordb_driver = CustomFalkorDBDriver(
+            host=config.falkordb.host,
+            port=config.falkordb.port,
+            username=config.falkordb.username,
+            password=config.falkordb.password,
+            base_database=config.falkordb.database,
         )
+        
+        # Initialize Graphiti client with custom driver
+        graphiti_client = Graphiti(graph_driver=falkordb_driver, llm_client=llm_client, embedder=embedder_client, max_coroutines=SEMAPHORE_LIMIT)
 
         # Destroy graph if requested
         if config.destroy_graph:
@@ -647,6 +734,52 @@ def format_fact_result(edge: EntityEdge) -> dict[str, Any]:
     return result
 
 
+def get_effective_group_id(override_group_id: str = '') -> str:
+    """Get the effective group_id using the priority: headers > config > environment > default.
+    
+    This ensures consistent group_id resolution across all tool calls.
+    Headers checked: X-Group-ID, X-Group-Id, group-id, Group-ID
+        
+    Returns:
+        The effective group_id to use
+    """
+    global config
+    
+    # First check for override parameter
+    if override_group_id and override_group_id.strip():
+        result = override_group_id.strip()
+        logger.info(f"[get_effective_group_id] Using override parameter: {result}")
+        return result
+    
+    # Then check for group_id in request headers
+    headers = current_headers.get()
+    if headers is not None:
+        logger.debug(f"[get_effective_group_id] Checking request headers: {headers}")
+        # Check various header formats (convert to lowercase for case-insensitive lookup)
+        headers_lower = {k.lower(): v for k, v in headers.items()}
+        header_names = ['x-group-id', 'group-id']
+        for header_name in header_names:
+            header_value = headers_lower.get(header_name)
+            if header_value:
+                result = header_value.strip()
+                logger.info(f"[get_effective_group_id] Using header {header_name}: {result}")
+                return result
+        logger.debug(f"[get_effective_group_id] No group_id found in headers, falling back to config/env")
+    else:
+        logger.debug(f"[get_effective_group_id] No request headers available, using config/env")
+    
+    # Fallback to config
+    if config.group_id is not None:
+        result = config.group_id
+        logger.info(f"[get_effective_group_id] Using config.group_id: {result}")
+        return result
+    else:
+        # Fallback to environment variable or default
+        result = os.environ.get('GROUP_ID', 'default')
+        logger.info(f"[get_effective_group_id] Using env/default: {result}")
+        return result
+
+
 # Dictionary to store queues for each group_id
 # Each queue is a list of tasks to be processed sequentially
 episode_queues: dict[str, asyncio.Queue] = {}
@@ -692,11 +825,11 @@ async def process_episode_queue(group_id: str):
 async def add_memory(
     name: str,
     episode_body: str,
-    group_id: str | None = None,
     source: str = 'text',
     source_description: str = '',
-    uuid: str | None = None,
-) -> SuccessResponse | ErrorResponse:
+    uuid: Optional[str] = None,
+    group_id: str = '',
+):
     """Add an episode to memory. This is the primary way to add information to the graph.
 
     This function returns immediately and processes the episode addition in the background.
@@ -707,14 +840,18 @@ async def add_memory(
         episode_body (str): The content of the episode to persist to memory. When source='json', this must be a
                            properly escaped JSON string, not a raw Python dictionary. The JSON data will be
                            automatically processed to extract entities and relationships.
-        group_id (str, optional): A unique ID for this graph. If not provided, uses the default group_id from CLI
-                                 or a generated one.
         source (str, optional): Source type, must be one of:
                                - 'text': For plain text content (default)
                                - 'json': For structured data
                                - 'message': For conversation-style content
         source_description (str, optional): Description of the source
         uuid (str, optional): Optional UUID for the episode
+        group_id (str, optional): Override group_id for this specific operation
+        
+    Note:
+        The group_id is determined with priority: function parameter > HTTP headers > GROUP_ID env var > CLI argument > "default".
+        Supported headers: X-Group-ID, X-Group-Id, group-id, Group-ID
+        Each group_id creates a separate FalkorDB database with automatic database creation if needed.
 
     Examples:
         # Adding plain text content
@@ -722,8 +859,7 @@ async def add_memory(
             name="Company News",
             episode_body="Acme Corp announced a new product line today.",
             source="text",
-            source_description="news article",
-            group_id="some_arbitrary_string"
+            source_description="news article"
         )
 
         # Adding structured JSON data
@@ -740,8 +876,7 @@ async def add_memory(
             name="Customer Conversation",
             episode_body="user: What's your return policy?\nassistant: You can return items within 30 days.",
             source="message",
-            source_description="chat transcript",
-            group_id="some_arbitrary_string"
+            source_description="chat transcript"
         )
 
     Notes:
@@ -754,6 +889,11 @@ async def add_memory(
     """
     global graphiti_client, episode_queues, queue_workers
 
+    # Debug: Print environment variables on every request
+    logger.info(f"[add_memory] GROUP_ID env var: {os.environ.get('GROUP_ID', 'NOT_SET')}")
+    logger.info(f"[add_memory] Config group_id: {config.group_id}")
+    logger.info(f"[add_memory] All env vars containing 'GROUP': {[(k, v) for k, v in os.environ.items() if 'GROUP' in k.upper()]}")
+
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
@@ -765,12 +905,8 @@ async def add_memory(
         elif source.lower() == 'json':
             source_type = EpisodeType.json
 
-        # Use the provided group_id or fall back to the default from config
-        effective_group_id = group_id if group_id is not None else config.group_id
-
-        # Cast group_id to str to satisfy type checker
-        # The Graphiti client expects a str for group_id, not Optional[str]
-        group_id_str = str(effective_group_id) if effective_group_id is not None else ''
+        # Use the group_id from parameter, environment variable/config/default
+        group_id_str = get_effective_group_id(group_id)
 
         # We've already checked that graphiti_client is not None above
         # This assert statement helps type checkers understand that graphiti_client is defined
@@ -778,6 +914,9 @@ async def add_memory(
 
         # Use cast to help the type checker understand that graphiti_client is not None
         client = cast(Graphiti, graphiti_client)
+        
+        # Switch to the appropriate database for this group_id
+        await client.driver.set_database_for_group(group_id_str)
 
         # Define the episode processing function
         async def process_episode():
@@ -796,8 +935,6 @@ async def add_memory(
                     reference_time=datetime.now(timezone.utc),
                     entity_types=entity_types,
                 )
-                logger.info(f"Episode '{name}' added successfully")
-
                 logger.info(f"Episode '{name}' processed successfully")
             except Exception as e:
                 error_msg = str(e)
@@ -805,21 +942,11 @@ async def add_memory(
                     f"Error processing episode '{name}' for group_id {group_id_str}: {error_msg}"
                 )
 
-        # Initialize queue for this group_id if it doesn't exist
-        if group_id_str not in episode_queues:
-            episode_queues[group_id_str] = asyncio.Queue()
+        # For stdio transport, process the episode synchronously so data is written before the process exits
+        await process_episode()
 
-        # Add the episode processing function to the queue
-        await episode_queues[group_id_str].put(process_episode)
-
-        # Start a worker for this queue if one isn't already running
-        if not queue_workers.get(group_id_str, False):
-            asyncio.create_task(process_episode_queue(group_id_str))
-
-        # Return immediately with a success message
-        return SuccessResponse(
-            message=f"Episode '{name}' queued for processing (position: {episode_queues[group_id_str].qsize()})"
-        )
+        # Return success after processing
+        return SuccessResponse(message=f"Episode '{name}' processed successfully")
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error queuing episode task: {error_msg}')
@@ -829,11 +956,11 @@ async def add_memory(
 @mcp.tool()
 async def search_memory_nodes(
     query: str,
-    group_ids: list[str] | None = None,
     max_nodes: int = 10,
-    center_node_uuid: str | None = None,
+    center_node_uuid: Optional[str] = None,
     entity: str = '',  # cursor seems to break with None
-) -> NodeSearchResponse | ErrorResponse:
+    group_id: str = '',
+):
     """Search the graph memory for relevant node summaries.
     These contain a summary of all of a node's relationships with other nodes.
 
@@ -841,21 +968,30 @@ async def search_memory_nodes(
 
     Args:
         query: The search query
-        group_ids: Optional list of group IDs to filter results
         max_nodes: Maximum number of nodes to return (default: 10)
         center_node_uuid: Optional UUID of a node to center the search around
         entity: Optional single entity type to filter results (permitted: "Preference", "Procedure")
+        
+    Note:
+        The group_id is automatically determined from the GROUP_ID environment variable, CLI argument, or defaults to "default".
     """
     global graphiti_client
+
+    # Debug: Print environment variables on every request
+    logger.info(f"[search_memory_nodes] GROUP_ID env var: {os.environ.get('GROUP_ID', 'NOT_SET')}")
+    logger.info(f"[search_memory_nodes] Config group_id: {config.group_id}")
+    logger.info(f"[search_memory_nodes] All env vars containing 'GROUP': {[(k, v) for k, v in os.environ.items() if 'GROUP' in k.upper()]}")
 
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids if group_ids is not None else [config.group_id] if config.group_id else []
-        )
+        # Use the group_id from parameter, environment variable/config/default
+        effective_group_id = get_effective_group_id(group_id)
+        effective_group_ids = [effective_group_id] if effective_group_id else []
+        
+        # Switch to the appropriate database for this group_id
+        await graphiti_client.driver.set_database_for_group(effective_group_id)
 
         # Configure the search
         if center_node_uuid is not None:
@@ -874,8 +1010,8 @@ async def search_memory_nodes(
         # Use cast to help the type checker understand that graphiti_client is not None
         client = cast(Graphiti, graphiti_client)
 
-        # Perform the search using the _search method
-        search_results = await client._search(
+        # Perform the search using the search_ method
+        search_results = await client.search_(
             query=query,
             config=search_config,
             group_ids=effective_group_ids,
@@ -883,11 +1019,8 @@ async def search_memory_nodes(
             search_filter=filters,
         )
 
-        if not search_results.nodes:
-            return NodeSearchResponse(message='No relevant nodes found', nodes=[])
-
         # Format the node results
-        formatted_nodes: list[NodeResult] = [
+        formatted_nodes = [
             {
                 'uuid': node.uuid,
                 'name': node.name,
@@ -900,7 +1033,10 @@ async def search_memory_nodes(
             for node in search_results.nodes
         ]
 
-        return NodeSearchResponse(message='Nodes retrieved successfully', nodes=formatted_nodes)
+        return {
+            'message': f'Retrieved {len(formatted_nodes)} nodes',
+            'nodes': formatted_nodes
+        }
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error searching nodes: {error_msg}')
@@ -910,51 +1046,64 @@ async def search_memory_nodes(
 @mcp.tool()
 async def search_memory_facts(
     query: str,
-    group_ids: list[str] | None = None,
     max_facts: int = 10,
-    center_node_uuid: str | None = None,
-) -> FactSearchResponse | ErrorResponse:
+    center_node_uuid: Optional[str] = None,
+    group_id: str = '',
+):
     """Search the graph memory for relevant facts.
 
     Args:
         query: The search query
-        group_ids: Optional list of group IDs to filter results
         max_facts: Maximum number of facts to return (default: 10)
         center_node_uuid: Optional UUID of a node to center the search around
+        group_id: Optional group ID to override the default
+        
+    Note:
+        The group_id is automatically determined from the GROUP_ID environment variable, CLI argument, or defaults to "default".
     """
     global graphiti_client
+
+    # Debug: Print environment variables on every request
+    logger.info(f"[search_memory_facts] GROUP_ID env var: {os.environ.get('GROUP_ID', 'NOT_SET')}")
+    logger.info(f"[search_memory_facts] Config group_id: {config.group_id}")
+    logger.info(f"[search_memory_facts] All env vars containing 'GROUP': {[(k, v) for k, v in os.environ.items() if 'GROUP' in k.upper()]}")
 
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
-        # Validate max_facts parameter
-        if max_facts <= 0:
+        # Validate parameters
+        if not isinstance(query, str) or not query.strip():
+            return ErrorResponse(error='query must be a non-empty string')
+        
+        if not isinstance(max_facts, int) or max_facts <= 0:
             return ErrorResponse(error='max_facts must be a positive integer')
 
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids if group_ids is not None else [config.group_id] if config.group_id else []
-        )
+        # Use the group_id from parameter, environment variable/config/default
+        effective_group_id = get_effective_group_id(group_id)
+        effective_group_ids = [effective_group_id] if effective_group_id else []
 
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None
 
         # Use cast to help the type checker understand that graphiti_client is not None
         client = cast(Graphiti, graphiti_client)
+        
+        # Switch to the appropriate database for this group_id
+        await client.driver.set_database_for_group(effective_group_id)
 
         relevant_edges = await client.search(
-            group_ids=effective_group_ids,
             query=query,
-            num_results=max_facts,
             center_node_uuid=center_node_uuid,
+            group_ids=effective_group_ids,
+            num_results=max_facts,
         )
 
-        if not relevant_edges:
-            return FactSearchResponse(message='No relevant facts found', facts=[])
-
         facts = [format_fact_result(edge) for edge in relevant_edges]
-        return FactSearchResponse(message='Facts retrieved successfully', facts=facts)
+        return {
+            'message': f'Retrieved {len(facts)} facts',
+            'facts': facts
+        }
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error searching facts: {error_msg}')
@@ -969,6 +1118,10 @@ async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
         uuid: UUID of the entity edge to delete
     """
     global graphiti_client
+
+    # Debug: Print environment variables on every request
+    logger.info(f"[delete_entity_edge] GROUP_ID env var: {os.environ.get('GROUP_ID', 'NOT_SET')}")
+    logger.info(f"[delete_entity_edge] Config group_id: {config.group_id}")
 
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
@@ -1000,6 +1153,10 @@ async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
     """
     global graphiti_client
 
+    # Debug: Print environment variables on every request
+    logger.info(f"[delete_episode] GROUP_ID env var: {os.environ.get('GROUP_ID', 'NOT_SET')}")
+    logger.info(f"[delete_episode] Config group_id: {config.group_id}")
+
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
@@ -1030,6 +1187,10 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
     """
     global graphiti_client
 
+    # Debug: Print environment variables on every request
+    logger.info(f"[get_entity_edge] GROUP_ID env var: {os.environ.get('GROUP_ID', 'NOT_SET')}")
+    logger.info(f"[get_entity_edge] Config group_id: {config.group_id}")
+
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
@@ -1054,28 +1215,39 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
 
 @mcp.tool()
 async def get_episodes(
-    group_id: str | None = None, last_n: int = 10
-) -> list[dict[str, Any]] | EpisodeSearchResponse | ErrorResponse:
-    """Get the most recent memory episodes for a specific group.
+    last_n: int = 10,
+    group_id: str = '',
+):
+    """Get the most recent memory episodes for the configured group.
 
     Args:
-        group_id: ID of the group to retrieve episodes from. If not provided, uses the default group_id.
         last_n: Number of most recent episodes to retrieve (default: 10)
+        
+    Note:
+        The group_id is automatically determined from the GROUP_ID environment variable, CLI argument, or defaults to "default".
     """
     global graphiti_client
+
+    # Debug: Print environment variables on every request
+    logger.info(f"[get_episodes] GROUP_ID env var: {os.environ.get('GROUP_ID', 'NOT_SET')}")
+    logger.info(f"[get_episodes] Config group_id: {config.group_id}")
+    logger.info(f"[get_episodes] All env vars containing 'GROUP': {[(k, v) for k, v in os.environ.items() if 'GROUP' in k.upper()]}")
 
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
-        # Use the provided group_id or fall back to the default from config
-        effective_group_id = group_id if group_id is not None else config.group_id
+        # Use the group_id from parameter, environment variable/config/default
+        effective_group_id = get_effective_group_id(group_id)
 
-        if not isinstance(effective_group_id, str):
-            return ErrorResponse(error='Group ID must be a string')
+        if not effective_group_id:
+            return ErrorResponse(error='Group ID must be provided or configured')
 
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None
+        
+        # Switch to the appropriate database for this group_id
+        await graphiti_client.driver.set_database_for_group(effective_group_id)
 
         # Use cast to help the type checker understand that graphiti_client is not None
         client = cast(Graphiti, graphiti_client)
@@ -1084,11 +1256,6 @@ async def get_episodes(
             group_ids=[effective_group_id], last_n=last_n, reference_time=datetime.now(timezone.utc)
         )
 
-        if not episodes:
-            return EpisodeSearchResponse(
-                message=f'No episodes found for group {effective_group_id}', episodes=[]
-            )
-
         # Use Pydantic's model_dump method for EpisodicNode serialization
         formatted_episodes = [
             # Use mode='json' to handle datetime serialization
@@ -1096,8 +1263,11 @@ async def get_episodes(
             for episode in episodes
         ]
 
-        # Return the Python list directly - MCP will handle serialization
-        return formatted_episodes
+        # Return consistent dict format
+        return {
+            'message': f'Retrieved {len(formatted_episodes)} episodes for group {effective_group_id}',
+            'episodes': formatted_episodes
+        }
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error getting episodes: {error_msg}')
@@ -1108,6 +1278,10 @@ async def get_episodes(
 async def clear_graph() -> SuccessResponse | ErrorResponse:
     """Clear all data from the graph memory and rebuild indices."""
     global graphiti_client
+
+    # Debug: Print environment variables on every request
+    logger.info(f"[clear_graph] GROUP_ID env var: {os.environ.get('GROUP_ID', 'NOT_SET')}")
+    logger.info(f"[clear_graph] Config group_id: {config.group_id}")
 
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
@@ -1131,7 +1305,7 @@ async def clear_graph() -> SuccessResponse | ErrorResponse:
 
 @mcp.resource('http://graphiti/status')
 async def get_status() -> StatusResponse:
-    """Get the status of the Graphiti MCP server and Neo4j connection."""
+    """Get the status of the Graphiti MCP server and FalkorDB connection."""
     global graphiti_client
 
     if graphiti_client is None:
@@ -1144,18 +1318,19 @@ async def get_status() -> StatusResponse:
         # Use cast to help the type checker understand that graphiti_client is not None
         client = cast(Graphiti, graphiti_client)
 
-        # Test database connection
-        await client.driver.client.verify_connectivity()  # type: ignore
+        # Test database connection - FalkorDB uses Redis protocol
+        # We can try a simple ping or query to verify connectivity
+        await client.driver.client.ping()  # type: ignore
 
         return StatusResponse(
-            status='ok', message='Graphiti MCP server is running and connected to Neo4j'
+            status='ok', message='Graphiti MCP server is running and connected to FalkorDB'
         )
     except Exception as e:
         error_msg = str(e)
-        logger.error(f'Error checking Neo4j connection: {error_msg}')
+        logger.error(f'Error checking FalkorDB connection: {error_msg}')
         return StatusResponse(
             status='error',
-            message=f'Graphiti MCP server is running but Neo4j connection failed: {error_msg}',
+            message=f'Graphiti MCP server is running but FalkorDB connection failed: {error_msg}',
         )
 
 
@@ -1164,18 +1339,12 @@ async def initialize_server() -> MCPConfig:
     global config
 
     parser = argparse.ArgumentParser(
-        description='Run the Graphiti MCP server with optional LLM client'
+        description='Run the Graphiti MCP server with stdio transport'
     )
     parser.add_argument(
         '--group-id',
         help='Namespace for the graph. This is an arbitrary string used to organize related data. '
-        'If not provided, a random UUID will be generated.',
-    )
-    parser.add_argument(
-        '--transport',
-        choices=['sse', 'stdio'],
-        default='sse',
-        help='Transport to use for communication with the client. (default: sse)',
+        'If not provided, will use GROUP_ID environment variable or "default".',
     )
     parser.add_argument(
         '--model', help=f'Model name to use with the LLM client. (default: {DEFAULT_LLM_MODEL})'
@@ -1187,18 +1356,13 @@ async def initialize_server() -> MCPConfig:
     parser.add_argument(
         '--temperature',
         type=float,
-        help='Temperature setting for the LLM (0.0-2.0). Lower values make output more deterministic. (default: 0.7)',
+        help='Temperature setting for the LLM (0.0-2.0). Lower values make output more deterministic. (default: 0.0)',
     )
     parser.add_argument('--destroy-graph', action='store_true', help='Destroy all Graphiti graphs')
     parser.add_argument(
         '--use-custom-entities',
         action='store_true',
         help='Enable entity extraction using the predefined ENTITY_TYPES',
-    )
-    parser.add_argument(
-        '--host',
-        default=os.environ.get('MCP_SERVER_HOST'),
-        help='Host to bind the MCP server to (default: MCP_SERVER_HOST environment variable)',
     )
 
     args = parser.parse_args()
@@ -1208,9 +1372,14 @@ async def initialize_server() -> MCPConfig:
 
     # Log the group ID configuration
     if args.group_id:
-        logger.info(f'Using provided group_id: {config.group_id}')
+        logger.info(f'Using CLI provided group_id: {config.group_id}')
+    elif os.environ.get('GROUP_ID') or os.environ.get('group_id'):
+        # Check both GROUP_ID and group_id for compatibility
+        env_group_id = os.environ.get('GROUP_ID') or os.environ.get('group_id')
+        config.group_id = env_group_id
+        logger.info(f'Using group_id from environment variable: {config.group_id}')
     else:
-        logger.info(f'Generated random group_id: {config.group_id}')
+        logger.info(f'Using default group_id: {config.group_id}')
 
     # Log entity extraction configuration
     if config.use_custom_entities:
@@ -1221,29 +1390,18 @@ async def initialize_server() -> MCPConfig:
     # Initialize Graphiti
     await initialize_graphiti()
 
-    if args.host:
-        logger.info(f'Setting MCP server host to: {args.host}')
-        # Set MCP server host from CLI or env
-        mcp.settings.host = args.host
-
-    # Return MCP configuration
-    return MCPConfig.from_cli(args)
+    # Return MCP configuration for stdio transport
+    return MCPConfig(transport='stdio')
 
 
 async def run_mcp_server():
-    """Run the MCP server in the current event loop."""
+    """Run the MCP server with stdio transport."""
     # Initialize the server
     mcp_config = await initialize_server()
 
-    # Run the server with stdio transport for MCP in the same event loop
-    logger.info(f'Starting MCP server with transport: {mcp_config.transport}')
-    if mcp_config.transport == 'stdio':
-        await mcp.run_stdio_async()
-    elif mcp_config.transport == 'sse':
-        logger.info(
-            f'Running MCP server with SSE transport on {mcp.settings.host}:{mcp.settings.port}'
-        )
-        await mcp.run_sse_async()
+    # Run the server with stdio transport
+    logger.info('Starting MCP server with stdio transport')
+    await mcp.run_stdio_async()
 
 
 def main():

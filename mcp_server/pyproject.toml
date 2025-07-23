@@ -1,13 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "mcp-server"
 version = "0.4.0"
-description = "Graphiti MCP Server"
+description = "Graphiti MCP Server with FalkorDB support"
 readme = "README.md"
 requires-python = ">=3.10,<4"
 dependencies = [
-    "mcp>=1.5.0",
+    "mcp[cli]",
     "openai>=1.68.2",
-    "graphiti-core>=0.14.0",
+    "graphiti-core[falkordb]>=0.17.0",
+    "falkordb>=1.0.0",
     "azure-identity>=1.21.0",
-    "graphiti-core",
+    "fastapi>=0.100.0",
 ]
+
+[project.scripts]
+graphiti-mcp-server = "graphiti_mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["graphiti_mcp_server.py"]
+
+[tool.uv]
+package = true
